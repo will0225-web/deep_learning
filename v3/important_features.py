@@ -1,0 +1,468 @@
+import sys
+import os
+os.add_dll_directory("C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v11.8\\bin")
+# 使用sys.path.append()將父目錄添加到系統路徑中。
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+import numpy as np
+import datetime
+import pandas as pd
+import tensorflow as tf
+
+from sklearn.feature_selection import mutual_info_regression
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import LassoCV
+
+from keras.regularizers import l1_l2
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
+from sklearn.compose import ColumnTransformer
+from sklearn.utils import class_weight
+from sklearn.utils.class_weight import compute_class_weight
+
+from modules import data as modules_data
+from modules import signals as signals
+from modules import indicators as indicators
+from modules import model as model_process
+from modules import custom_model_fit_indicators as custom_model_fit_indicators
+
+from scipy import stats
+
+from tensorflow.keras.utils import to_categorical
+
+import shap
+
+def multiclass_f1_score(y_true, y_pred):
+    return custom_model_fit_indicators.multiclass_one_hot_f1_score(y_true, y_pred)
+
+def calculate_targets(df, period):
+    df['Future_Low'] = df['Low'].rolling(window=period, min_periods=1).min().shift(-period)
+    df['Future_Low_Pos'] = df['Low'].rolling(window=period, min_periods=1).apply(lambda x: np.argmin(x) + 1).shift(-period)
+    return df
+
+# def calculate_targets(df, period, multiplier=1.5):
+#     # 计算未来period的收盘价变化率
+#     df['SL_Touch'] = 0  # 初始化趋势标签为0
+#     df['ATR_Multiplier'] = df['ATR'] * multiplier
+#     # 重置索引以确保索引是连续的整数
+#     df = df.reset_index(drop=True)
+#     # # 根据价格变化率和阈值判断趋势
+#     # df['Trend_Target'] = np.where(df['Price_Change'] > threshold, 1,
+#     #                               np.where(df['Price_Change'] < -threshold, 2, 0))
+
+#     for i in range(len(df) - period):
+#         close_price = df.at[i, 'Close']
+#         future_atr_multiplier = df.at[i, 'ATR_Multiplier']
+
+#         # 计算未来period内每一天的价格变化率
+#         for j in range(1, period + 1):
+#             future_high = df.at[i + j, 'High']
+#             future_low = df.at[i + j, 'Low']
+
+#             if future_low <= close_price - future_atr_multiplier:
+#                 df.at[i, 'SL_Touch'] = 1
+#                 break
+#             elif future_high >= close_price + future_atr_multiplier:
+#                 df.at[i, 'SL_Touch'] = 2
+#                 break
+#     return df
+
+def calculate_trend(df, period=144, threshold=0.05):
+    # 计算周期内的最高点和最低点
+    df['Highest_High'] = df['High'].rolling(window=period).max()
+    df['Lowest_Low'] = df['Low'].rolling(window=period).min()
+    
+    # 找到最高点和最低点的位置
+    df['High_Pos'] = df['High'].rolling(window=period).apply(lambda x: np.argmax(x), raw=True)
+    df['Low_Pos'] = df['Low'].rolling(window=period).apply(lambda x: np.argmin(x), raw=True)
+    
+    # 计算最高点和最低点的差异
+    df['High_Low_Diff'] = (df['Highest_High'] - df['Lowest_Low']) / df['Lowest_Low']
+    
+    # 判断趋势：最高点在最低点左边且差异大于7% -> 向下（2），最高点在最低点右边且差异大于7% -> 向上（1），否则 -> 无趋势（0）
+    df['Trend'] = np.where((df['High_Low_Diff'] > threshold) & (df['High_Pos'] < df['Low_Pos']), 2,
+                           np.where((df['High_Low_Diff'] > threshold) & (df['High_Pos'] > df['Low_Pos']), 1, 0))
+    
+    # 删除rolling没有结果的行
+    df = df.dropna(subset=['Highest_High', 'Lowest_Low', 'High_Pos', 'Low_Pos'])
+    
+    # 删除不必要的列
+    df = df.drop(columns=['Highest_High', 'Lowest_Low', 'High_Pos', 'Low_Pos', 'High_Low_Diff'])
+    
+    return df
+
+def customized_specific_period_col(df):
+    customized_cols_infos = []
+    
+    # 紀錄原先的cols
+    original_cols = set(df.columns)
+    price_look_back = 672
+    
+    # indicator_look_back = 288
+    
+    # df, lower_low_higher_high_info = indicators.add_lower_low_higher_high(df, 0.04, look_back=indicator_look_back, is_need_return_function_info=True)
+    # customized_cols_infos.append(lower_low_higher_high_info)
+    
+    df, price_indicator_info = indicators.add_price_indicator(df, look_back=price_look_back, is_need_return_function_info=True)
+    customized_cols_infos.append(price_indicator_info)
+
+    # df, supertrend_delta_info = indicators.super_trend_delta_and_risk(df, is_need_return_function_info=True)
+    # customized_cols_infos.append(supertrend_delta_info)
+    df, supertrend_delta_info = indicators.super_trend_delta_and_risk_v1(df, is_need_return_function_info=True)
+    customized_cols_infos.append(supertrend_delta_info)
+    # df, supertrend_risk_score_info = indicators.calculate_supertrend_risk(df, is_need_return_function_info=True)
+    # customized_cols_infos.append(supertrend_risk_score_info)
+
+    df, look_back_24h_min_max_price_info = indicators.add_24h_min_max_price(df, look_back=96, is_need_return_function_info=True)
+    customized_cols_infos.append(look_back_24h_min_max_price_info)
+
+    df = calculate_volatility(df, 8)
+    di_len = 14
+    adx_len = 14
+    df = calculate_adx(df, di_len, adx_len)
+    df = calculate_moving_averages(df)
+    df = calculate_bollinger_bands(df)
+    df = calculate_momentum(df)
+    df = calculate_ppo(df)
+    df = calculate_trend(df, 288, 0.04)
+
+    df['EMA_7'] = indicators.calculate_ema(df['Close'], 7)
+    df['EMA_25'] = indicators.calculate_ema(df['Close'], 25)
+    df['EMA_99'] = indicators.calculate_ema(df['Close'], 99)
+
+    # 计算价格变化和对数收益率
+    df['Open_Change_Rate'] = df['Open'].pct_change().fillna(0)
+    df['High_Change_Rate'] = df['High'].pct_change().fillna(0)
+    df['Low_Change_Rate'] = df['Low'].pct_change().fillna(0)
+    df['Close_Change_Rate'] = df['Close'].pct_change().fillna(0)
+    # 计算成交量变化率
+    df['Volume_Change'] = df['Volume'].pct_change().fillna(0)
+
+    df['Close_Open_Ratio'] = df['Close'] / df['Open']
+    df['High_Low_Ratio'] = df['High'] / df['Low']
+    df['Close_High_Ratio'] = df['Close'] / df['High']
+    df['Close_Low_Ratio'] = df['Close'] / df['Low']
+
+    # 计算布林带宽度
+    df['BB_Width'] = df['Upper Band'] - df['Lower Band']
+    # 计算布林带宽度变化率
+    df['BB_Width_Ratio'] = df['BB_Width'].pct_change().fillna(0)
+    
+    # 對數收益率
+    df['Log_Returns'] = np.log(df['Close'] / df['Close'].shift(1))
+    df['Volatility'] = df['Log_Returns'].rolling(window=20).std()
+    
+    df['SMA_5'] = indicators.calculate_sma(df['Close'], 5)
+    df['SMA_10'] = indicators.calculate_sma(df['Close'], 10)
+
+    df = calculate_VWAP(df)
+
+    # 紀錄新的cols
+    modified_cols = set(df.columns)
+    # 篩選多出來的cols
+    new_cols = list(modified_cols - original_cols)
+    return df, customized_cols_infos, new_cols
+
+def calculate_VWAP(df):
+    # data['Typical_Price'] = (data['Close'] + data['High'] + data['Low']) / 3
+    df['Typical_Price'] = df['Close']
+    df['VP'] = df['Typical_Price'] * df['Volume']
+
+    df['Cumulative_VP'] = df['VP'].cumsum()
+    df['Cumulative_Volume'] = df['Volume'].cumsum()
+    df['VWAP'] = df['Cumulative_VP'] / df['Cumulative_Volume']
+
+    df = df.drop(columns=['VP', 'Typical_Price', 'Cumulative_VP', 'Cumulative_Volume'])
+    return df
+
+
+def calculate_dm(df):
+    df['up'] = df['High'] - df['High'].shift(1)
+    df['down'] = df['Low'].shift(1) - df['Low']
+    df['+DM'] = np.where((df['up'] > df['down']) & (df['up'] > 0), df['up'], 0)
+    df['-DM'] = np.where((df['down'] > df['up']) & (df['down'] > 0), df['down'], 0)
+    return df
+
+def calculate_rma(series, period):
+    rma = series.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    return rma
+
+def calculate_di(df, period):
+    df['TR_sum'] = calculate_rma(df['TR'], period)
+    df['+DM_sum'] = calculate_rma(df['+DM'], period)
+    df['-DM_sum'] = calculate_rma(df['-DM'], period)
+    df['+DI'] = 100 * (df['+DM_sum'] / df['TR_sum'])
+    df['-DI'] = 100 * (df['-DM_sum'] / df['TR_sum'])
+    return df
+
+def calculate_dx(df):
+    df['DX'] = 100 * (abs(df['+DI'] - df['-DI']) / (df['+DI'] + df['-DI']))
+    return df
+
+def calculate_adx(df, di_len, adx_len):
+    df = calculate_dm(df)
+    df = calculate_di(df, di_len)
+    df = calculate_dx(df)
+    df['ADX'] = calculate_rma(df['DX'], adx_len)
+    return df
+
+def calculate_volatility(df, look_back):
+    df['Close_Volatility'] = df['Close'].rolling(window=look_back).std()
+    df['High_Volatility'] = df['High'].rolling(window=look_back).std()
+    df['Low_Volatility'] = df['Low'].rolling(window=look_back).std()
+    df['Open_Volatility'] = df['Open'].rolling(window=look_back).std()
+    return df
+
+def calculate_moving_averages(df, short_window=50, long_window=200):
+    df['Short_MA'] = df['Close'].rolling(window=short_window).mean()
+    df['Long_MA'] = df['Close'].rolling(window=long_window).mean()
+    return df
+
+def calculate_bollinger_bands(df):
+    df['BB_Width'] = df['Upper Band'] - df['Lower Band']
+    df['BB_Pos'] = (df['Close'] - df['Lower Band']) / (df['Upper Band'] - df['Lower Band'])
+    return df
+
+def calculate_momentum(df, window=10):
+    df['Momentum'] = df['Close'].diff(window)
+    return df
+
+def calculate_ppo(df, short_window=12, long_window=26):
+    short_ema = df['Close'].ewm(span=short_window, adjust=False).mean()
+    long_ema = df['Close'].ewm(span=long_window, adjust=False).mean()
+    df['PPO'] = (short_ema - long_ema) / long_ema * 100
+    return df
+
+# 假设df是你的数据框，包含所有需要的列
+def calculate_rolling_stats(df, window=20):
+    rolling_mean = df.rolling(window=window).mean()
+    rolling_std = df.rolling(window=window).std()
+    return rolling_mean, rolling_std
+
+def transform_and_data_info(df, y, cols, robust_features, standard_features, minMax_features, front_drop_count, back_drop_count, look_back, original_X=[]):
+    data = df[cols]
+
+    # 列出每个缩放器/转换器对应的特征
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('price', RobustScaler(), robust_features),
+            ('percent', StandardScaler(), standard_features),
+            ('bounded', MinMaxScaler(feature_range=(0, 1)), minMax_features),
+        ],
+        remainder='passthrough'  # 不需要缩放的特征保持原样
+    )
+    # 对特征进行缩放
+    if len(original_X) == 0:
+        scaled = preprocessor.fit_transform(data)
+    else:
+        preprocessor.fit(original_X[cols])
+        # 对特征进行缩放
+        scaled = preprocessor.transform(data)
+
+    if look_back != 0:
+        scaled, y = modules_data.create_look_back_dataset(scaled, y, look_back)
+    
+    if front_drop_count == 0 and back_drop_count == 0:
+        scaled = scaled
+        y = y
+    elif front_drop_count != 0:
+        scaled = scaled[front_drop_count:]
+        y = y[front_drop_count:]
+    elif back_drop_count == 0:
+        scaled = scaled[:back_drop_count]
+        y = y[:back_drop_count]
+
+    # 加上customized cols資訊
+    transform_data_info = {
+        'cols': cols,
+        'robust_features': robust_features,
+        'standard_features': standard_features,
+        'minMax_features': minMax_features,
+        'front_drop_count': front_drop_count,
+        'back_drop_count': back_drop_count,
+        'look_back': look_back
+    }
+    return scaled, y, transform_data_info
+
+def print_outliers_and_return(data):
+    # 计算z-score
+    z_scores = np.abs(stats.zscore(data.select_dtypes(include=[np.number])))
+    print("Z-scores:\n", z_scores)
+
+    # 找到异常值
+    threshold = 3  # 通常使用3作为z-score的阈值
+    outliers = (z_scores > threshold)
+    print("Outliers:\n", outliers)
+
+    # 计算每列的异常值数量
+    outliers_counts = outliers.sum(axis=0)
+    print("Outliers Counts per column:\n", outliers_counts)
+
+    # 计算总的异常值数量
+    total_outliers = outliers_counts.sum()
+    print("Total Outliers:", total_outliers)
+
+
+    total_rows = data.shape[0]
+    # 计算异常值所占的比例
+    outliers_ratio = total_outliers / (total_rows * data.shape[1])
+    print("Outliers Ratio: {:.2%}".format(outliers_ratio))
+
+    return outliers
+
+def train_data(df, y):
+    ochl_cols = ['Close', 'High', 'Low', 'Open', 'Volume', 'ATR']
+    outliers = print_outliers_and_return(df[ochl_cols])
+
+    ochl_robust_features = ['ATR', 'Volume']
+    ochl_standard_features = ['Close', 'High', 'Low', 'Open']
+    ochl_minMax_features = []
+    X_ochl_scaled, X_ochl_y, ochl_data_info = transform_and_data_info(X, y, ochl_cols, ochl_robust_features, ochl_standard_features, ochl_minMax_features, 0, 0, look_back)
+
+    return X_ochl_scaled, X_ochl_y, ochl_data_info
+
+# def evaluate_tolerance(model, X_test, y_pos_test, scaler_pos, tolerance=2):
+#     # 预测
+#     preds = model.predict(X_test)
+    
+#     # 逆缩放预测值
+#     preds_low = preds[0]
+#     preds_pos = preds[1]
+#     preds_pos_inverse = scaler_pos.inverse_transform(preds_pos)
+    
+#     # 将 y_pos_test 逆缩放回原始范围
+#     y_pos_test_inverse = scaler_pos.inverse_transform(y_pos_test)
+
+#     # 计算容忍范围内的准确性
+#     correct = 0
+#     total_loss = 0
+#     for pred, true in zip(preds_pos_inverse, y_pos_test_inverse):
+#         if abs(pred - true) <= tolerance:
+#             correct += 1
+#         # 计算损失
+#         total_loss += (0 if abs(pred - true) <= tolerance else (pred - true) ** 2)
+
+#     accuracy = correct / len(y_pos_test)
+#     avg_loss = total_loss / len(y_pos_test)
+
+#     print(f"Accuracy within tolerance range: {accuracy:.2%}")
+#     print(f"Average Loss with tolerance: {avg_loss}")
+
+#     return accuracy, avg_loss
+
+def evaluate_tolerance(model, X_test, y_test, scaler_low, tolerance=5):
+    # 预测
+    preds = model.predict(X_test)
+    
+    # 逆缩放预测值
+    preds_inverse = scaler_low.inverse_transform(preds)
+    y_test_inverse = scaler_low.inverse_transform(y_test)
+
+    # 计算容忍范围内的准确性和总损失
+    correct = 0
+    total_loss = 0
+    for pred, true in zip(preds_inverse, y_test_inverse):
+        if abs(pred - true) <= tolerance:
+            correct += 1
+        total_loss += (0 if abs(pred - true) <= tolerance else (pred - true) ** 2)
+
+    accuracy = correct / len(y_test)
+    avg_loss = total_loss / len(y_test)
+
+    print(f"Accuracy within tolerance range: {accuracy:.2%}")
+    print(f"Average Loss with tolerance: {avg_loss}")
+
+    return accuracy, avg_loss
+
+
+symbol = "ETHUSDT"
+interval = "15m"
+look_back = 288 #使用回看n根數據
+epochs = 150
+batch_size = 128
+total_klines = 150000
+get_local_file_name = 'train_data_with_hidden_states.csv'
+input_model_infos = []
+
+# 當前
+# end_time = int(datetime.datetime.timestamp(datetime.datetime.now())) * 1000
+
+# end_time_seconds = end_time / 1000
+# end_datetime = datetime.datetime.fromtimestamp(end_time_seconds)
+# end_time_string = end_datetime.strftime("%Y-%m-%d %H:%M:%S")
+
+# 特定
+end_time_string = "2023-12-31 23:59:59"
+
+
+# 轉毫秒
+# end_time = int(datetime.datetime.timestamp(datetime.datetime.strptime(end_time_string, "%Y-%m-%d %H:%M:%S"))) * 1000
+# Step 1: 獲取數據
+df = modules_data.get_binance_klines_backward(symbol, interval, end_time_string, total_klines, get_local_file_name, is_need_save_original_data=False, is_need_calculated=True)
+df, customized_cols_infos, new_cols = customized_specific_period_col(df)
+period = 48
+df = calculate_targets(df, period)
+
+# 拿掉前後無參考性資料
+drop_front_data_count = 1000
+drop_back_data_count = 300
+df = df[drop_front_data_count:-drop_back_data_count]
+df.drop(columns=['datetime', 'SMA_5', 'EMA_12', 'SMA_10', 'SMA_12', 'EMA_26', 'SMA_20', 'SMA_21', 'SMA_27', 'Unnamed: 0', 'EMA_50', 'Short_MA', 'SMA_55', 'SMA_50', 'Long_MA', 'SMA_200', 'Future_Low_Pos'], inplace=True)
+df.reset_index(drop=True, inplace=True)
+
+df.fillna(0, inplace=True)
+df.replace([np.inf, -np.inf], np.nan, inplace=True)
+df.interpolate(method='linear', inplace=True)
+
+numeric_cols = df.select_dtypes(include=[np.number]).columns
+
+# 检查 NaN 值的数量
+nan_counts = df[numeric_cols].isna().sum()
+print("NaN Counts:\n", nan_counts)
+
+inf_counts = np.isinf(df[numeric_cols]).sum()
+print("Infinity Counts:\n", inf_counts)
+
+total_nan_inf = nan_counts + inf_counts
+print("Total NaN and Infinity Counts:\n", total_nan_inf)
+
+# 检查所有列中 NaN 值的行
+nan_volume_rows = df[df[numeric_cols].isna().any(axis=1)]
+inf_volume_rows = df[np.isinf(df[numeric_cols]).any(axis=1)]
+print("Rows with NaN column:\n", nan_volume_rows)
+print("Rows with inf column:\n", inf_volume_rows)
+
+df.reset_index(drop=True, inplace=True)
+
+# X = df
+# y = df['Future_Low']
+target_variable = 'Future_Low'
+X = df.drop(columns=[target_variable])
+y = df[target_variable]
+
+
+index = 20
+
+# 计算皮尔逊相关系数
+correlation_matrix = df.corr()
+correlation_with_low = correlation_matrix[target_variable].abs().sort_values(ascending=False)
+top_10_features_corr = correlation_with_low.index[1:index + 1]  # 排除 'Low' 本身
+print("Top 10 features based on Pearson correlation:")
+print(top_10_features_corr)
+
+# 计算互信息
+mi = mutual_info_regression(X, y)
+mi = pd.Series(mi, index=X.columns)
+mi = mi.sort_values(ascending=False)
+top_10_features_mi = mi.index[:index]
+print("Top 10 features based on mutual information:")
+print(top_10_features_mi)
+
+# 训练随机森林模型
+rf = RandomForestRegressor(n_estimators=100, random_state=42)
+rf.fit(X, y)
+feature_importances = pd.Series(rf.feature_importances_, index=X.columns)
+feature_importances = feature_importances.sort_values(ascending=False)
+top_10_features_rf = feature_importances.index[:index]
+print("Top 10 features based on feature importance from RandomForest:")
+print(top_10_features_rf)

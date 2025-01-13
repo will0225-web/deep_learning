@@ -1,0 +1,10 @@
+[{'target': 5, 'max_total_profit': 0.05696437081618013, 'max_start': 0.36000000000000015, 'max_end': 0.37000000000000016, 'tp': 0.01}, 
+{'target': 5, 'max_total_profit': 0.04596966303846559, 'max_start': 0.36000000000000015, 'max_end': 0.37000000000000016, 'tp': 0.015}, 
+{'target': 5, 'max_total_profit': 0.08332489328810092, 'max_start': 0.3200000000000001, 'max_end': 0.3300000000000001, 'tp': 0.019999999999999997}, 
+{'target': 5, 'max_total_profit': 0.12340496727528351, 'max_start': 0.34000000000000014, 'max_end': 0.37000000000000016, 'tp': 0.024999999999999998}, 
+{'target': 5, 'max_total_profit': 0.1120858622710318, 'max_start': 0.34000000000000014, 'max_end': 0.37000000000000016, 'tp': 0.03}, 
+{'target': 6, 'max_total_profit': 0.13887323448875843, 'max_start': 0.258, 'max_end': 0.265, 'tp': 0.01}, 
+{'target': 6, 'max_total_profit': 0.2264866636826883, 'max_start': 0.243, 'max_end': 0.265, 'tp': 0.015}, 
+{'target': 6, 'max_total_profit': 0.11347629079890544, 'max_start': 0.251, 'max_end': 0.253, 'tp': 0.019999999999999997}, 
+{'target': 6, 'max_total_profit': 0.09105782471651809, 'max_start': 0.258, 'max_end': 0.262, 'tp': 0.024999999999999998}, 
+{'target': 6, 'max_total_profit': 0.07966070631382183, 'max_start': 0.25, 'max_end': 0.252, 'tp': 0.03}]
